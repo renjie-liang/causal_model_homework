@@ -11,11 +11,10 @@ from causalml.inference.meta import BaseSRegressor
 # from lightgbm import LGBMRegressor
 from sklearn.metrics import roc_auc_score, accuracy_score, recall_score
 from sklearn.ensemble import RandomForestRegressor
-from causalml.inference.meta import LRSRegressor
 
 np.random.seed(0)
 torch.manual_seed(0)
-exp_id = "Transformer_best"
+exp_id = "Transformer_onemodel"
 output_dir = os.path.join("./results", exp_id)
 logger = get_logger(output_dir, exp_id)
 
@@ -28,12 +27,18 @@ T = np.load('./data/T.npy') #  (4338, 1)
 X = np.load('./data/X.npy') #  (4338, 10, 1437)
 Y = np.load('./data/y.npy') #  (4338, 1)
 
+
 X = torch.tensor(X, dtype=torch.float32).to(device)
 T = torch.tensor(T, dtype=torch.float32).squeeze().to(device)
 Y = torch.tensor(Y, dtype=torch.float32).to(device)
 
+# concate the T and X
+T_extended = T.unsqueeze(1).expand(-1, X.size(1))  # Shape (4338, 10)
+T_extended = T_extended.unsqueeze(-1)  # Shape (4338, 10, 1)
+X = torch.cat((X, T_extended), dim=2)  # Shape (4338, 10, 1438)
 
-X = torch.nn.functional.normalize(X, dim=1)
+X = torch.nn.functional.normalize(X, dim=-1)
+
 
 X_train_val, X_test, Y_train_val, Y_test, T_train_val, T_test = train_test_split(X, Y, T, test_size=0.2, random_state=0)
 
@@ -86,14 +91,6 @@ class TransformerModel(nn.Module):
         out = self.regressor(out)
         return out.squeeze(1)  # Return shape should match target shape (batch_size,)
 
-    def get_features(self, x):
-        x = self.embedding(x) 
-        x = x.permute(1, 0, 2)
-        transformer_out = self.transformer_encoder(x) 
-        hidden = transformer_out[-1, :, :]  
-        return hidden.squeeze(1) 
-
-
 def eval_epoch(model, criterion, X_in, Y_in):
     model.eval()
     with torch.no_grad():
@@ -111,21 +108,17 @@ def main():
     kf = KFold(n_splits=5, shuffle=True, random_state=0)
     fold_results = []
     ate_results = []
-    best_test_acc = 0
-    best_test_performance = None
+    best_val_acc = 0
     best_epoch = None
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(X_train_val)):
         print(f'Fold {fold + 1}')
-        best_val_acc = 0
         # Split data
         X_train, X_val = X_train_val[train_idx], X_train_val[val_idx]
         Y_train, Y_val = Y_train_val[train_idx], Y_train_val[val_idx]
         T_train, T_val = T_train_val[train_idx], T_train_val[val_idx]
         
         # Define loss function and optimizer
-
-
         model = TransformerModel(input_size=X.shape[-1], hidden_size=args.hidden_size, num_layers=args.num_layers, num_heads=args.num_heads, dropout=args.dropout).to(device)
         criterion = nn.MSELoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
@@ -152,36 +145,35 @@ def main():
             logger.info(f'Fold {fold}, Epoch [{epoch+1}|{num_epochs}], Train Loss: {loss.item():.4f}, Val Loss: {val_loss.item():.4f}')
             logger.info(f'Val Set AUC: {val_auc:.4f}, Accuracy: {val_accuracy:.4f}, Sensitivity: {val_sensitivity:.4f}')
             logger.info("")
+        # fold_results.append(best_val_loss)
 
-        # Load the best model state
         model.load_state_dict(best_model_state)
         test_loss, test_auc, test_accuracy, test_sensitivity = eval_epoch(model, criterion, X_test, Y_test)
-        fold_results.append([test_auc, test_accuracy, test_sensitivity])
 
-        #    Extract LSTM features for train and validation datasets
-        model.eval()
-        with torch.no_grad():
-            X_train_val_feat = model.get_features(X_train_val).cpu().numpy()
-            X_feat_test = model.get_features(X_test).cpu().numpy()
 
-        # Use a Random Forest as the base learner
-        # base_learner = RandomForestRegressor()
-        T_train_val_np = T_train_val.squeeze().cpu().numpy()
-        T_test_np = T_test.squeeze().cpu().numpy()
-        Y_train_val_np = Y_train_val.squeeze().cpu().numpy()
-        Y_test_np = Y_test.squeeze().cpu().numpy()
-
-        learner = LRSRegressor()
-        learner.fit(X=X_train_val_feat, treatment=T_train_val_np, y=Y_train_val_np)
-        ate = learner.estimate_ate(X=X_feat_test, treatment=T_test_np, y=Y_test_np, pretrain=True)
-        ate_results.append(ate)
+        X_test_tream = X_test.clone()
+        X_test_tream[:,:, -1] = 1
         
+        X_test_notream = X_test.clone()
+        X_test_notream[:, :, -1] = 0
+
+        Y_test_tream =  model(X_test_tream)
+        Y_test_notream =  model(X_test_notream)
+
+        ATE = (Y_test_tream - Y_test_notream).mean()
+        logger.warning(f"ATE {ATE}")
+        logger.info(f"Best fold {best_epoch}")
+        logger.info(args)
+        logger.info(f'Test Set AUC: {test_auc:.4f}, Accuracy: {test_accuracy:.4f}, Sensitivity: {test_sensitivity:.4f}')
+
+
+    # Load the best model state
+    model.load_state_dict(best_model_state)
+    test_loss, test_auc, test_accuracy, test_sensitivity = eval_epoch(model, criterion, X_test, Y_test)
     logger.info(f"Best fold {best_epoch}")
     logger.info(args)
     logger.info(f'Test Set AUC: {test_auc:.4f}, Accuracy: {test_accuracy:.4f}, Sensitivity: {test_sensitivity:.4f}')
 
-    logger.info(f"fold_results {fold_results}")
-    logger.info(f"ate_results {ate_results}")
-    
+
 if __name__ == "__main__":
     main()

@@ -123,9 +123,8 @@ def main():
     # learner = BaseTRegressor(learner=LinearRegression())
     # learner = BaseXRegressor(learner=XGBRegressor())
     # learner = BaseXRegressor(learner=LinearRegression())
-    learner = BaseRRegressor(learner=XGBRegressor())
+    # learner = BaseRRegressor(learner=XGBRegressor())
     learner = BaseRRegressor(learner=LinearRegression())
-
 
     ate_s = learner.estimate_ate(X=X_feat, treatment=T_np, y=Y_np)
     logger.info(ate_s)
