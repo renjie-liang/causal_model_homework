@@ -1,16 +1,62 @@
-srun --partition=gpu --gres=gpu:1 --nodes=1 --cpus-per-task=16 --mem=100gb --time=02:00:00 --account=bianjiang --qos=bianjiang --reservation=bianjiang --pty bash -i
 
-    AUC                 Accuracy            Sensitivity
-    [0.9352101314834235, 0.9285714285714286, 0.9316770186335404],
-    [0.9612648221343874, 0.9285714285714286, 0.9337474120082816], 
-    [0.9439810706891452, 0.9320276497695853, 0.9233954451345756], 
-    [0.9409480788362775, 0.9251152073732719, 0.9399585921325052], 
-    [0.958075878572773, 0.934331797235023, 0.9337474120082816]
+# Assessing the Impact of Antihypertensive Combination on the Progression of Mild Cognitive Impairment to Alzheimer's Disease Using Electronic Health Records
+
+**Transformer + LRSRegressor**
+```
+INFO:acc: 0.9225±0.0056
+INFO:auc: 0.9531±0.0113
+INFO:sen: 0.9330±0.0225
+INFO:ate: 0.0004±0.0018
+INFO:ate_low: -0.0041±0.0045
+INFO:ate_up: 0.0049±0.0045
+```
+
+**Transformer + XGBRegressor**
+```
+INFO:acc: 0.9225±0.0056
+INFO:auc: 0.9531±0.0113
+INFO:sen: 0.9330±0.0225
+INFO:ate: -0.0158±0.0152
+INFO:ate_low: -0.0847±0.0091
+INFO:ate_up: 0.0531±0.0258
+```
+
+**Transformer + RandomForestRegressor**
+```
+INFO:acc: 0.9225±0.0056
+INFO:auc: 0.9531±0.0113
+INFO:sen: 0.9330±0.0225
+INFO:ate: 0.0000±0.0000
+```
+
+**LSTM + LRSRegressor**
+```
+INFO:acc: 0.8923±0.0074
+INFO:auc: 0.9216±0.0119
+INFO:sen: 0.9199±0.0291
+INFO:ate: -0.0012±0.0035
+INFO:ate_low: -0.0091±0.0043
+INFO:ate_up: 0.0066±0.0036
+```
 
 
-    ATE           ATE_low      ATE_upper
-    (-0.00508189, -0.01806191, 0.00789813),
-    (-0.0014881, -0.01067827, 0.00770207),
-    (0.00015919, -0.01519696, 0.01551533),
-    (-0.00239868, -0.01430052, 0.00950317),
-    (-0.00575867, -0.01529656, 0.00377922)
+**LSTM + XGBRegressor**
+```
+INFO:acc: 0.8923±0.0074
+INFO:auc: 0.9216±0.0119
+INFO:sen: 0.9199±0.0291
+INFO:ate: -0.0011±0.0215
+INFO:ate_low: -0.0922±0.0286
+INFO:ate_up: 0.0899±0.0191
+```
+
+**LSTM + RandomForestRegressor**
+```
+INFO:acc: 0.8923±0.0074
+INFO:auc: 0.9216±0.0119
+INFO:sen: 0.9199±0.0291
+INFO:ate: 0.0002±0.0009
+```
+
+
+

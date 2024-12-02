@@ -16,6 +16,7 @@ from causalml.inference.meta import BaseXRegressor, BaseRRegressor, BaseSRegress
 from xgboost import XGBRegressor
 from sklearn.metrics import roc_curve, auc
 from models.LSTM import LSTMModel
+from sklearn.utils import resample
 
 np.random.seed(0)
 torch.manual_seed(0)
@@ -50,6 +51,16 @@ args = {"hidden_size": 512,
 args = EasyDict(args)
 logger.info(args)
 
+def bootstrap_ate(X, T, Y, learner, n_bootstrap=1000):
+    ate_estimates = []
+    for _ in range(n_bootstrap):
+        X_resample, T_resample, Y_resample = resample(X, T, Y)
+        learner.fit(X=X_resample, treatment=T_resample, y=Y_resample)
+        ate = learner.estimate_ate(X=X_resample, treatment=T_resample, y=Y_resample, pretrain=True)
+        ate_estimates.append(ate)
+    lower_bound = np.percentile(ate_estimates, 2.5)
+    upper_bound = np.percentile(ate_estimates, 97.5)
+    return np.mean(ate_estimates), lower_bound, upper_bound
 
 
 def eval_epoch(model, criterion, X_in, Y_in):
@@ -130,19 +141,16 @@ def main():
         T_train_np = T_train.squeeze().cpu().numpy()
         T_val_np = T_val.squeeze().cpu().numpy()
         Y_train_np = Y_train.squeeze().cpu().numpy()
-        Y_test_np = Y_val.squeeze().cpu().numpy()
+        Y_val_np = Y_val.squeeze().cpu().numpy()
 
-        learner = LRSRegressor()
-        # learner = BaseTRegressor(learner=XGBRegressor())
-        # learner = BaseTRegressor(learner=MLPTRegressor())
-        # learner = BaseSRegressor(learner=RandomForestRegressor())
+        learner = BaseSRegressor(learner=RandomForestRegressor())
 
-        learner.fit(X=X_train_feat, treatment=T_train_np, y=Y_train_np)
-        val_ate = learner.estimate_ate(X=X_val_feat, treatment=T_val_np, y=Y_test_np, pretrain=True)
-        # metrics_manager['ate'].add(val_ate[0])
-        metrics_manager['ate'].add(val_ate[0][0])
-        metrics_manager['ate_low'].add(val_ate[1][0])
-        metrics_manager['ate_up'].add(val_ate[2][0])
+        val_ate, lower_bound, upper_bound = bootstrap_ate(
+            X=X_val_feat, T=T_val_np, Y=Y_val_np, learner=learner, n_bootstrap=1000)
+
+        metrics_manager['ate'].add(val_ate)
+        metrics_manager['ate_low'].add(lower_bound)
+        metrics_manager['ate_up'].add(upper_bound)
 
         # Save the fpr and tpr for ROC plotting
         fpr, tpr, _ = roc_curve(Y_val.cpu(), val_predictions.cpu())
@@ -161,7 +169,7 @@ def main():
     logger.info(f"ate_low: {metrics_manager['ate_low'].mean():.4f}±{metrics_manager['ate_low'].std():.4f}")
     logger.info(f"ate_up: {metrics_manager['ate_up'].mean():.4f}±{metrics_manager['ate_up'].std():.4f}")
     
-    plot_auc_curves(fprs, tprs, aucs, f"{exp_id}_auc.png")
+    # plot_auc_curves(fprs, tprs, aucs, f"{exp_id}_auc.png")
 
 if __name__ == "__main__":
     main()

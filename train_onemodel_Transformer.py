@@ -5,21 +5,18 @@ import torch.nn.functional as F
 
 import numpy as np
 from sklearn.model_selection import KFold, train_test_split
-from utils import get_logger, MetricsManager, normalize_no_dummy, plot_auc_curves
+from utils import get_logger, MetricsManager
 from easydict import EasyDict
 from causalml.inference.meta import BaseSRegressor
 # from lightgbm import LGBMRegressor
 from sklearn.metrics import roc_auc_score, accuracy_score, recall_score
 from sklearn.ensemble import RandomForestRegressor
-from causalml.inference.meta import LRSRegressor, MLPTRegressor
-from causalml.inference.meta import BaseXRegressor, BaseRRegressor, BaseSRegressor, BaseTRegressor
-from xgboost import XGBRegressor
-from sklearn.metrics import roc_curve, auc
-from models.LSTM import LSTMModel
+from sklearn.utils import resample
+from models.Transformer import TransformerModel
 
 np.random.seed(0)
 torch.manual_seed(0)
-exp_id = "LSTM"
+exp_id = "Transformer_onemodel"
 output_dir = os.path.join("./results", exp_id)
 logger = get_logger(output_dir, exp_id)
 
@@ -32,16 +29,21 @@ T = np.load('./data/T.npy') #  (4338, 1)
 X = np.load('./data/X.npy') #  (4338, 10, 1437)
 Y = np.load('./data/y.npy') #  (4338, 1)
 
+
 X = torch.tensor(X, dtype=torch.float32).to(device)
 T = torch.tensor(T, dtype=torch.float32).squeeze().to(device)
 Y = torch.tensor(Y, dtype=torch.float32).to(device)
 
-X = normalize_no_dummy(X)
-# X = torch.nn.functional.normalize(X, dim=1)
+# concate the T and X
+T_extended = T.unsqueeze(1).expand(-1, X.size(1))  # Shape (4338, 10)
+T_extended = T_extended.unsqueeze(-1)  # Shape (4338, 10, 1)
+X = torch.cat((X, T_extended), dim=2)  # Shape (4338, 10, 1438)
 
+X = torch.nn.functional.normalize(X, dim=1)
 
 
 args = {"hidden_size": 512,
+        "num_heads": 8,
         "num_layers": 2,
         "dropout": 0.2,
         "learning_rate": 0.0001,
@@ -49,7 +51,6 @@ args = {"hidden_size": 512,
 
 args = EasyDict(args)
 logger.info(args)
-
 
 
 def eval_epoch(model, criterion, X_in, Y_in):
@@ -61,21 +62,44 @@ def eval_epoch(model, criterion, X_in, Y_in):
         auc = roc_auc_score(Y_in.cpu(), predictions.cpu())
         accuracy = accuracy_score(Y_in.cpu(), (predictions > 0.5).cpu().int())
         sensitivity = recall_score(Y_in.cpu(), (predictions > 0.5).cpu().int())
-    return loss, auc, accuracy, sensitivity, predictions
+    return loss, auc, accuracy, sensitivity
+
+# Clone the data as needed
+def calculate_ate(X_val, model):
+    X_val_tream = X_val.clone()
+    X_val_tream[:, :, -1] = 1
+    
+    X_val_notream = X_val.clone()
+    X_val_notream[:, :, -1] = 0
+
+    Y_val_tream = model(X_val_tream)
+    Y_val_notream = model(X_val_notream)
+
+    val_ate = (Y_val_tream - Y_val_notream).mean().item()  # Convert from tensor to scalar for consistency
+    return val_ate
+
+# Bootstrapping to calculate confidence intervals
+def bootstrap_ate(X_val, model, n_bootstrap=1000):
+    ate_bootstrap = []
+    for _ in range(n_bootstrap):
+        X_resample = resample(X_val)  # Resample with replacement
+        ate_bootstrap.append(calculate_ate(X_resample, model))
+    
+    lower_bound = np.percentile(ate_bootstrap, 2.5)  # 2.5th percentile
+    upper_bound = np.percentile(ate_bootstrap, 97.5)  # 97.5th percentile
+    return lower_bound, upper_bound
 
 def main():
     num_epochs = args.num_epochs
     # K-fold cross-validation
     kf = KFold(n_splits=5, shuffle=True, random_state=0)
+    fold_results = []
+    ate_results = []
+    best_val_acc = 0
     best_epoch = None
     metrics_manager = MetricsManager()
-    fprs = []
-    tprs = []
-    aucs = []
-
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
-        print(f'Fold {fold + 1}')
         best_val_acc = 0
         # Split data
         X_train, X_val = X[train_idx], X[val_idx]
@@ -83,8 +107,7 @@ def main():
         T_train, T_val = T[train_idx], T[val_idx]
         
         # Define loss function and optimizer
-
-        model = LSTMModel(input_size=X.shape[-1], hidden_size=args.hidden_size, num_layers=args.num_layers, dropout=args.dropout).to(device)
+        model = TransformerModel(input_size=X.shape[-1], hidden_size=args.hidden_size, num_layers=args.num_layers, num_heads=args.num_heads, dropout=args.dropout).to(device)
         criterion = nn.MSELoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
@@ -98,7 +121,7 @@ def main():
             optimizer.step()
             
             # Validation loop
-            val_loss, val_auc, val_accuracy, val_sensitivity, _ = eval_epoch(model, criterion, X_val, Y_val)
+            val_loss, val_auc, val_accuracy, val_sensitivity = eval_epoch(model, criterion, X_val, Y_val)
 
             # Check if this is the best epoch
             if val_accuracy > best_val_acc:
@@ -107,53 +130,26 @@ def main():
                 best_model_state = model.state_dict()
                 torch.save(model.state_dict(), f"{output_dir}/best_fold_{fold+1}.pth")
 
-
             logger.info(f'Fold {fold}, Epoch [{epoch+1}|{num_epochs}], Train Loss: {loss.item():.4f}, Val Loss: {val_loss.item():.4f}')
             logger.info(f'Val Set AUC: {val_auc:.4f}, Accuracy: {val_accuracy:.4f}, Sensitivity: {val_sensitivity:.4f}')
-            logger.info("")
+        # fold_results.append(best_val_loss)
 
         # Load the best model state
         model.load_state_dict(best_model_state)
-        val_loss, val_auc, val_acc, val_sen, val_predictions= eval_epoch(model, criterion, X_val, Y_val)
+        val_loss, val_auc, val_acc, val_sen = eval_epoch(model, criterion, X_val, Y_val)
         metrics_manager['auc'].add(val_auc)
         metrics_manager['acc'].add(val_acc)
         metrics_manager['sen'].add(val_sen)
 
-        #    Extract LSTM features for train and validation datasets
-        model.eval()
-        with torch.no_grad():
-            X_train_feat = model.get_features(X_train).cpu().numpy()
-            X_val_feat = model.get_features(X_val).cpu().numpy()
+        val_ate = calculate_ate(X_val, model)
+        val_ate_low, val_ate_up = bootstrap_ate(X_val, model)
+        metrics_manager['ate'].add(val_ate)
+        metrics_manager['ate_low'].add(val_ate_low)
+        metrics_manager['ate_up'].add(val_ate_up)
 
-        # Use a Random Forest as the base learner
-        # base_learner = RandomForestRegressor()
-        T_train_np = T_train.squeeze().cpu().numpy()
-        T_val_np = T_val.squeeze().cpu().numpy()
-        Y_train_np = Y_train.squeeze().cpu().numpy()
-        Y_test_np = Y_val.squeeze().cpu().numpy()
-
-        learner = LRSRegressor()
-        # learner = BaseTRegressor(learner=XGBRegressor())
-        # learner = BaseTRegressor(learner=MLPTRegressor())
-        # learner = BaseSRegressor(learner=RandomForestRegressor())
-
-        learner.fit(X=X_train_feat, treatment=T_train_np, y=Y_train_np)
-        val_ate = learner.estimate_ate(X=X_val_feat, treatment=T_val_np, y=Y_test_np, pretrain=True)
-        # metrics_manager['ate'].add(val_ate[0])
-        metrics_manager['ate'].add(val_ate[0][0])
-        metrics_manager['ate_low'].add(val_ate[1][0])
-        metrics_manager['ate_up'].add(val_ate[2][0])
-
-        # Save the fpr and tpr for ROC plotting
-        fpr, tpr, _ = roc_curve(Y_val.cpu(), val_predictions.cpu())
-        fprs.append(fpr)
-        tprs.append(tpr)
-        aucs.append(val_auc)
-
-
+    # Load the best model state
     logger.info(f"Best fold {best_epoch}")
     logger.info(args)
-
     logger.info(f"acc: {metrics_manager['acc'].mean():.4f}±{metrics_manager['acc'].std():.4f}")
     logger.info(f"auc: {metrics_manager['auc'].mean():.4f}±{metrics_manager['auc'].std():.4f}")
     logger.info(f"sen: {metrics_manager['sen'].mean():.4f}±{metrics_manager['sen'].std():.4f}")
@@ -161,7 +157,6 @@ def main():
     logger.info(f"ate_low: {metrics_manager['ate_low'].mean():.4f}±{metrics_manager['ate_low'].std():.4f}")
     logger.info(f"ate_up: {metrics_manager['ate_up'].mean():.4f}±{metrics_manager['ate_up'].std():.4f}")
     
-    plot_auc_curves(fprs, tprs, aucs, f"{exp_id}_auc.png")
 
 if __name__ == "__main__":
     main()

@@ -5,17 +5,21 @@ import torch.nn.functional as F
 
 import numpy as np
 from sklearn.model_selection import KFold, train_test_split
-from utils import get_logger
+from utils import get_logger, MetricsManager, plot_auc_curves
 from easydict import EasyDict
 from causalml.inference.meta import BaseSRegressor
 # from lightgbm import LGBMRegressor
 from sklearn.metrics import roc_auc_score, accuracy_score, recall_score
 from sklearn.ensemble import RandomForestRegressor
 from causalml.inference.meta import LRSRegressor
+from causalml.inference.meta import BaseXRegressor, BaseRRegressor, BaseSRegressor, BaseTRegressor
+from xgboost import XGBRegressor
+from sklearn.metrics import roc_curve, auc
+
 
 np.random.seed(0)
 torch.manual_seed(0)
-exp_id = "Transformer_best"
+exp_id = "Transformer"
 output_dir = os.path.join("./results", exp_id)
 logger = get_logger(output_dir, exp_id)
 
@@ -34,8 +38,6 @@ Y = torch.tensor(Y, dtype=torch.float32).to(device)
 
 
 X = torch.nn.functional.normalize(X, dim=1)
-
-X_train_val, X_test, Y_train_val, Y_test, T_train_val, T_test = train_test_split(X, Y, T, test_size=0.2, random_state=0)
 
 args = {"hidden_size": 512,
         "num_heads": 8,
@@ -103,28 +105,26 @@ def eval_epoch(model, criterion, X_in, Y_in):
         auc = roc_auc_score(Y_in.cpu(), predictions.cpu())
         accuracy = accuracy_score(Y_in.cpu(), (predictions > 0.5).cpu().int())
         sensitivity = recall_score(Y_in.cpu(), (predictions > 0.5).cpu().int())
-    return loss, auc, accuracy, sensitivity
+    return loss, auc, accuracy, sensitivity, predictions
 
 def main():
     num_epochs = args.num_epochs
     # K-fold cross-validation
     kf = KFold(n_splits=5, shuffle=True, random_state=0)
-    fold_results = []
-    ate_results = []
-    best_test_acc = 0
-    best_test_performance = None
     best_epoch = None
-
-    for fold, (train_idx, val_idx) in enumerate(kf.split(X_train_val)):
+    metrics_manager = MetricsManager()
+    fprs = []
+    tprs = []
+    aucs = []
+    for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
         print(f'Fold {fold + 1}')
         best_val_acc = 0
         # Split data
-        X_train, X_val = X_train_val[train_idx], X_train_val[val_idx]
-        Y_train, Y_val = Y_train_val[train_idx], Y_train_val[val_idx]
-        T_train, T_val = T_train_val[train_idx], T_train_val[val_idx]
+        X_train, X_val = X[train_idx], X[val_idx]
+        Y_train, Y_val = Y[train_idx], Y[val_idx]
+        T_train, T_val = T[train_idx], T[val_idx]
         
         # Define loss function and optimizer
-
 
         model = TransformerModel(input_size=X.shape[-1], hidden_size=args.hidden_size, num_layers=args.num_layers, num_heads=args.num_heads, dropout=args.dropout).to(device)
         criterion = nn.MSELoss()
@@ -140,7 +140,7 @@ def main():
             optimizer.step()
             
             # Validation loop
-            val_loss, val_auc, val_accuracy, val_sensitivity = eval_epoch(model, criterion, X_val, Y_val)
+            val_loss, val_auc, val_accuracy, val_sensitivity,_ = eval_epoch(model, criterion, X_val, Y_val)
 
             # Check if this is the best epoch
             if val_accuracy > best_val_acc:
@@ -149,39 +149,57 @@ def main():
                 best_model_state = model.state_dict()
                 torch.save(model.state_dict(), f"{output_dir}/best_fold_{fold+1}.pth")
 
+
             logger.info(f'Fold {fold}, Epoch [{epoch+1}|{num_epochs}], Train Loss: {loss.item():.4f}, Val Loss: {val_loss.item():.4f}')
             logger.info(f'Val Set AUC: {val_auc:.4f}, Accuracy: {val_accuracy:.4f}, Sensitivity: {val_sensitivity:.4f}')
             logger.info("")
 
         # Load the best model state
         model.load_state_dict(best_model_state)
-        test_loss, test_auc, test_accuracy, test_sensitivity = eval_epoch(model, criterion, X_test, Y_test)
-        fold_results.append([test_auc, test_accuracy, test_sensitivity])
+        val_loss, val_auc, val_acc, val_sen, val_predictions= eval_epoch(model, criterion, X_val, Y_val)
+        metrics_manager['auc'].add(val_auc)
+        metrics_manager['acc'].add(val_acc)
+        metrics_manager['sen'].add(val_sen)
 
         #    Extract LSTM features for train and validation datasets
         model.eval()
         with torch.no_grad():
-            X_train_val_feat = model.get_features(X_train_val).cpu().numpy()
-            X_feat_test = model.get_features(X_test).cpu().numpy()
+            X_train_feat = model.get_features(X_train).cpu().numpy()
+            X_val_feat = model.get_features(X_val).cpu().numpy()
 
         # Use a Random Forest as the base learner
         # base_learner = RandomForestRegressor()
-        T_train_val_np = T_train_val.squeeze().cpu().numpy()
-        T_test_np = T_test.squeeze().cpu().numpy()
-        Y_train_val_np = Y_train_val.squeeze().cpu().numpy()
-        Y_test_np = Y_test.squeeze().cpu().numpy()
+        T_train_np = T_train.squeeze().cpu().numpy()
+        T_val_np = T_val.squeeze().cpu().numpy()
+        Y_train_np = Y_train.squeeze().cpu().numpy()
+        Y_test_np = Y_val.squeeze().cpu().numpy()
 
-        learner = LRSRegressor()
-        learner.fit(X=X_train_val_feat, treatment=T_train_val_np, y=Y_train_val_np)
-        ate = learner.estimate_ate(X=X_feat_test, treatment=T_test_np, y=Y_test_np, pretrain=True)
-        ate_results.append(ate)
-        
+        # learner = LRSRegressor()
+        # learner = BaseTRegressor(learner=XGBRegressor())
+        learner = BaseSRegressor(learner=RandomForestRegressor())
+
+        learner.fit(X=X_train_feat, treatment=T_train_np, y=Y_train_np)
+        val_ate = learner.estimate_ate(X=X_val_feat, treatment=T_val_np, y=Y_test_np, pretrain=True)
+        metrics_manager['ate'].add(val_ate[0])
+        # metrics_manager['ate'].add(val_ate[0][0])
+        # metrics_manager['ate_low'].add(val_ate[1][0])
+        # metrics_manager['ate_up'].add(val_ate[2][0])
+        fpr, tpr, _ = roc_curve(Y_val.cpu(), val_predictions.cpu())
+        fprs.append(fpr)
+        tprs.append(tpr)
+        aucs.append(val_auc)
+
     logger.info(f"Best fold {best_epoch}")
     logger.info(args)
-    logger.info(f'Test Set AUC: {test_auc:.4f}, Accuracy: {test_accuracy:.4f}, Sensitivity: {test_sensitivity:.4f}')
 
-    logger.info(f"fold_results {fold_results}")
-    logger.info(f"ate_results {ate_results}")
+    logger.info(f"acc: {metrics_manager['acc'].mean():.4f}±{metrics_manager['acc'].std():.4f}")
+    logger.info(f"auc: {metrics_manager['auc'].mean():.4f}±{metrics_manager['auc'].std():.4f}")
+    logger.info(f"sen: {metrics_manager['sen'].mean():.4f}±{metrics_manager['sen'].std():.4f}")
+    logger.info(f"ate: {metrics_manager['ate'].mean():.4f}±{metrics_manager['ate'].std():.4f}")
+    # logger.info(f"ate_low: {metrics_manager['ate_low'].mean():.4f}±{metrics_manager['ate_low'].std():.4f}")
+    # logger.info(f"ate_up: {metrics_manager['ate_up'].mean():.4f}±{metrics_manager['ate_up'].std():.4f}")
+    plot_auc_curves(fprs, tprs, aucs, f"{exp_id}_auc.png")
     
+
 if __name__ == "__main__":
     main()
